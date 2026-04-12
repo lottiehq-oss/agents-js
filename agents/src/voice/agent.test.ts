@@ -6,8 +6,10 @@ import { z } from 'zod';
 import { tool } from '../llm/index.js';
 import { initializeLogger } from '../log.js';
 import { Task } from '../utils.js';
-import { Agent, AgentTask, _setActivityTaskInfo } from './agent.js';
+import { _setActivityTaskInfo, Agent, AgentTask, speechHandleStorage } from './agent.js';
 import { AgentActivity, agentActivityStorage } from './agent_activity.js';
+import { SpeechHandle } from './speech_handle.js';
+import { RunResult } from './testing/run_result.js';
 import { defaultEndpointingOptions } from './turn_config/endpointing.js';
 import { defaultInterruptionOptions } from './turn_config/interruption.js';
 
@@ -152,6 +154,80 @@ describe('Agent', () => {
     });
 
     await expect(wrapper.result).resolves.toBe('ok');
+  });
+
+  // Regression: https://github.com/livekit/agents-js/issues/...
+  // When an AgentTask is awaited inside a tool's execute, its activity may create a new
+  // speech handle that is watched by the RunResult. If that new handle's pipeline completes
+  // quickly (e.g. under mocked TTS), the old code path called runState._markDoneIfNeeded()
+  // immediately after _updateActivity(). Since the parent handle had just been unwatched,
+  // the RunResult saw the only remaining watched handle as done and resolved prematurely —
+  // while the parent tool execution was still in progress. The fix removes that explicit
+  // call so handles resolve the RunState only via their own done callbacks when they truly
+  // complete.
+  it('should not prematurely resolve RunState when a nested AgentTask activity watches a done handle', async () => {
+    class TestTask extends AgentTask<string> {
+      constructor() {
+        super({ instructions: 'test task' });
+      }
+    }
+
+    const task = new TestTask();
+    const oldAgent = new Agent({ instructions: 'old agent' });
+
+    const runState = new RunResult({ userInput: 'hi' });
+    const parentHandle = SpeechHandle.create();
+    runState._watchHandle(parentHandle);
+
+    // Snapshot of runState.done() taken immediately after _updateActivity returns,
+    // before task.complete() is called. Under the buggy code path this would be `true`.
+    let doneAfterUpdateActivity: boolean | undefined;
+
+    const mockSession = {
+      currentAgent: oldAgent,
+      _globalRunState: runState,
+      _updateActivity: async (agent: Agent) => {
+        if (agent === task) {
+          // Simulate the AgentTask's activity creating a new speech handle whose
+          // pipeline finished before control returns to AgentTask.run(). This
+          // matches the race under fast/mocked TTS in evals.
+          const newHandle = SpeechHandle.create();
+          runState._watchHandle(newHandle);
+          newHandle._markDone();
+
+          // Schedule the state check + task completion after all microtasks drain.
+          // setTimeout (macrotask) runs after AgentTask.run() has finished its
+          // post-_updateActivity code and parked at `await this.future.await`.
+          // queueMicrotask would run BEFORE AgentTask.run()'s await continuation.
+          setTimeout(() => {
+            doneAfterUpdateActivity = runState.done();
+            task.complete('ok');
+          }, 0);
+        }
+      },
+    };
+
+    const mockActivity = {
+      agent: oldAgent,
+      agentSession: mockSession,
+      _onEnterTask: undefined,
+      llm: undefined,
+      close: async () => {},
+    };
+
+    const wrapper = Task.from(async () => {
+      const currentTask = Task.current();
+      if (!currentTask) {
+        throw new Error('expected task context');
+      }
+      _setActivityTaskInfo(currentTask, { inlineTask: true });
+      return await agentActivityStorage.run(mockActivity as any, () =>
+        speechHandleStorage.run(parentHandle, () => task.run()),
+      );
+    });
+
+    await expect(wrapper.result).resolves.toBe('ok');
+    expect(doneAfterUpdateActivity).toBe(false);
   });
 
   it('should require AgentTask to run inside AgentActivity context', async () => {
