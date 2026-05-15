@@ -5,6 +5,7 @@ import type { Throws } from '@livekit/throws-transformer/throws';
 import { APIConnectionError, APIError } from '../_exceptions.js';
 import { log } from '../log.js';
 import { type APIConnectOptions, DEFAULT_API_CONNECT_OPTIONS } from '../types.js';
+import { forwardOrShutdown } from '../utils.js';
 import type { ChatContext } from './chat_context.js';
 import type { ChatChunk } from './llm.js';
 import { LLM, LLMStream } from './llm.js';
@@ -209,6 +210,16 @@ class FallbackLLMStream extends LLMStream {
       extraKwargs: this.extraKwargs,
     });
 
+    // Propagate parent close → child. Without this the child keeps streaming
+    // tokens after the parent has been closed (wasted compute) and any
+    // provider-side error in that window would surface as a phantom fallback.
+    const cascadeClose = () => stream.close();
+    if (this.isShuttingDown) {
+      stream.close();
+    } else {
+      this.abortController.signal.addEventListener('abort', cascadeClose, { once: true });
+    }
+
     // Listen for error events - child LLMs emit errors via their LLM instance, not the stream
     let streamError: Error | undefined;
     const errorHandler = (ev: { error: Error }) => {
@@ -219,6 +230,7 @@ class FallbackLLMStream extends LLMStream {
     try {
       let shouldSetCurrent = !checkRecovery;
       for await (const chunk of stream) {
+        if (this.isShuttingDown) break;
         if (shouldSetCurrent) {
           shouldSetCurrent = false;
           this._currentStream = stream;
@@ -226,11 +238,21 @@ class FallbackLLMStream extends LLMStream {
         yield chunk;
       }
 
+      // Parent shutting down — exit silently regardless of child error state.
+      if (this.isShuttingDown) {
+        return;
+      }
+
       // If an error was emitted but not thrown through iteration, throw it now
       if (streamError) {
         throw streamError;
       }
     } catch (error) {
+      // Suppress all shutdown-time errors — these aren't real provider failures.
+      if (this.isShuttingDown) {
+        return;
+      }
+
       if (error instanceof APIError) {
         if (checkRecovery) {
           this._log.warn({ llm: llm.label(), error }, 'recovery failed');
@@ -259,6 +281,7 @@ class FallbackLLMStream extends LLMStream {
       throw error;
     } finally {
       llm.off('error', errorHandler);
+      this.abortController.signal.removeEventListener('abort', cascadeClose);
     }
   }
 
@@ -310,6 +333,8 @@ class FallbackLLMStream extends LLMStream {
     }
 
     for (let i = 0; i < this.adapter.llms.length; i++) {
+      if (this.isShuttingDown) return;
+
       const llm = this.adapter.llms[i]!;
       const status = this.adapter._status[i]!;
 
@@ -327,6 +352,7 @@ class FallbackLLMStream extends LLMStream {
 
           let chunkCount = 0;
           for await (const chunk of this.tryGenerate(llm, false)) {
+            if (this.isShuttingDown) return;
             chunkCount++;
             // Track what's been sent
             if (chunk.delta) {
@@ -344,8 +370,12 @@ class FallbackLLMStream extends LLMStream {
 
             // Forward chunk to queue
             this._log.debug({ llm: llm.label(), chunkCount }, 'run: forwarding chunk to queue');
-            this.queue.put(chunk);
+            if (forwardOrShutdown(this.queue, chunk, () => this.isShuttingDown) === 'shutdown') {
+              return;
+            }
           }
+
+          if (this.isShuttingDown) return;
 
           // Success!
           this._log.info(
@@ -354,6 +384,9 @@ class FallbackLLMStream extends LLMStream {
           );
           return;
         } catch (error) {
+          // Parent shutting down — don't engage fallback or mark unavailable.
+          if (this.isShuttingDown) return;
+
           // Mark as unavailable if it was available before
           if (status.available) {
             status.available = false;
@@ -382,6 +415,8 @@ class FallbackLLMStream extends LLMStream {
         }
       }
     }
+
+    if (this.isShuttingDown) return;
 
     // All LLMs failed
     const duration = (Date.now() - startTime) / 1000;

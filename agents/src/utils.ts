@@ -348,6 +348,47 @@ export class AsyncIterableQueue<T> implements AsyncIterableIterator<T> {
   }
 }
 
+/**
+ * Forward an item to a queue, treating "queue closed during shutdown" as
+ * expected.
+ *
+ * `AsyncIterableQueue.put` throws when the queue is closed. Callers that
+ * forward events from a child stream into their own queue have to handle the
+ * race where the parent stream's `close()` lands between iterations: the put
+ * throws even though nothing is actually broken. This helper distinguishes
+ * that case from a real error.
+ *
+ * - Returns `'shutdown'` if `isShuttingDown()` is true or the queue is closed
+ *   either before or after the put attempt.
+ * - Returns `'ok'` if the put succeeded.
+ * - Re-throws any other error.
+ *
+ * @example
+ * ```ts
+ * for await (const ev of child) {
+ *   if (forwardOrShutdown(this.queue, ev, () => this.abortSignal.aborted) === 'shutdown') {
+ *     break;
+ *   }
+ * }
+ * ```
+ */
+export function forwardOrShutdown<T>(
+  queue: AsyncIterableQueue<T>,
+  item: T,
+  isShuttingDown: () => boolean,
+): 'ok' | 'shutdown' {
+  if (isShuttingDown() || queue.closed) return 'shutdown';
+  try {
+    queue.put(item);
+    return 'ok';
+  } catch (e) {
+    // close() may have raced between the guard above and the put itself —
+    // re-check so we only swallow expected shutdown closes.
+    if (isShuttingDown() || queue.closed) return 'shutdown';
+    throw e;
+  }
+}
+
 /** @internal */
 export class ExpFilter {
   #alpha: number;

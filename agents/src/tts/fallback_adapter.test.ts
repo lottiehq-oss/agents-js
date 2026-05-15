@@ -18,6 +18,7 @@ class MockSynthesizeStream extends SynthesizeStream {
   constructor(
     private mockTts: MockTTS,
     private shouldFail: boolean,
+    private frameDelayMs: number,
     connOptions?: APIConnectOptions,
   ) {
     super(mockTts, connOptions);
@@ -37,6 +38,10 @@ class MockSynthesizeStream extends SynthesizeStream {
     for await (const data of this.input) {
       if (this.abortController.signal.aborted) break;
       if (data === SynthesizeStream.FLUSH_SENTINEL) continue;
+      if (this.frameDelayMs > 0) {
+        await new Promise((r) => setTimeout(r, this.frameDelayMs));
+        if (this.abortController.signal.aborted) break;
+      }
       this.queue.put({
         requestId: 'mock-req',
         segmentId: 'mock-seg',
@@ -73,6 +78,7 @@ class MockChunkedStream extends ChunkedStream {
 class MockTTS extends TTS {
   label: string;
   shouldFail = false;
+  frameDelayMs = 0;
 
   constructor(label: string, sampleRate: number = SAMPLE_RATE) {
     super(sampleRate, 1, { streaming: true });
@@ -84,7 +90,7 @@ class MockTTS extends TTS {
   }
 
   stream(options?: { connOptions?: APIConnectOptions }): SynthesizeStream {
-    return new MockSynthesizeStream(this, this.shouldFail, options?.connOptions);
+    return new MockSynthesizeStream(this, this.shouldFail, this.frameDelayMs, options?.connOptions);
   }
 }
 
@@ -223,6 +229,51 @@ describe('TTS FallbackAdapter', () => {
 
     expect(frameCount).toBeGreaterThan(0);
     expect(adapter.status[0]!.available).toBe(false);
+    expect(adapter.status[1]!.available).toBe(true);
+
+    await adapter.close();
+  });
+
+  it('does not engage fallback when close() races with a streaming child', async () => {
+    // Regression: when AgentSession closes mid-synthesis, the parent stream's
+    // close() aborts. Without a shutdown guard, the inner for-await ends and
+    // any state-leak (queue close, child error) gets logged as a phantom
+    // fallback, flipping the primary to unavailable.
+    const primary = new MockTTS('primary');
+    primary.frameDelayMs = 30;
+    const secondary = new MockTTS('secondary');
+    const adapter = new FallbackAdapter({
+      ttsInstances: [primary, secondary],
+      maxRetryPerTTS: 0,
+      recoveryDelayMs: 60_000,
+    });
+
+    const availabilityChanges: Array<{ available: boolean }> = [];
+    (adapter as any).on('tts_availability_changed', (e: any) => availabilityChanges.push(e));
+
+    const stream = adapter.stream();
+    stream.updateInputStream(
+      new ReadableStream<string>({
+        start(controller) {
+          controller.enqueue('hello world');
+          controller.enqueue('another token');
+          controller.close();
+        },
+      }),
+    );
+
+    // Pull the first frame so the child is actively producing, then close.
+    const first = await stream.next();
+    expect(first.done).toBe(false);
+    stream.close();
+
+    // Drain to settle — must not throw and must not engage fallback.
+    for await (const _ of stream) {
+      // discard
+    }
+
+    expect(availabilityChanges).toEqual([]);
+    expect(adapter.status[0]!.available).toBe(true);
     expect(adapter.status[1]!.available).toBe(true);
 
     await adapter.close();

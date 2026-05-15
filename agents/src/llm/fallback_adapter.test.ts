@@ -240,6 +240,38 @@ describe('FallbackAdapter', () => {
     expect(adapter._status[0]!.recoveringTask).not.toBeNull();
   });
 
+  it('does not engage fallback when close() races with a slow child', async () => {
+    // Regression: when AgentSession closes mid-stream, FallbackLLMStream.close()
+    // aborts. Without a shutdown guard, the child's natural completion or any
+    // error in its window flows back into run() as a phantom provider failure,
+    // flipping the primary to unavailable and engaging the secondary.
+    const llm1 = new MockLLM('llm1');
+    const llm2 = new MockLLM('llm2');
+    const adapter = new FallbackAdapter({ llms: [llm1, llm2] });
+
+    const eventSpy = vi.fn();
+    (adapter as any).on('llm_availability_changed', eventSpy);
+
+    const stream = adapter.chat({ chatCtx: {} as ChatContext });
+
+    // Consume one chunk so the child stream is actively producing.
+    const first = await stream.next();
+    expect(first.done).toBe(false);
+
+    // Close mid-stream — primary is still pushing chunks every 10ms.
+    stream.close();
+
+    // Drain whatever the stream emits before settling. Must not throw, must
+    // not engage fallback.
+    for await (const _ of stream) {
+      // discard
+    }
+
+    expect(eventSpy).not.toHaveBeenCalled();
+    expect(adapter._status[0]!.available).toBe(true);
+    expect(adapter._status[1]!.available).toBe(true);
+  });
+
   it('should emit availability changed events', async () => {
     const llm1 = new MockLLM('llm1');
     llm1.shouldFail = true;

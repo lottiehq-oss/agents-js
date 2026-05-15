@@ -7,7 +7,7 @@ import { APIConnectionError, APIError } from '../_exceptions.js';
 import { log } from '../log.js';
 import { basic } from '../tokenize/index.js';
 import { type APIConnectOptions, DEFAULT_API_CONNECT_OPTIONS } from '../types.js';
-import { Task, cancelAndWait } from '../utils.js';
+import { Task, cancelAndWait, forwardOrShutdown } from '../utils.js';
 import { StreamAdapter } from './stream_adapter.js';
 import { ChunkedStream, SynthesizeStream, TTS, type TTSCapabilities } from './tts.js';
 
@@ -311,6 +311,10 @@ class FallbackChunkedStream extends ChunkedStream {
    * @throws {APIConnectionError} When all TTS providers have been exhausted
    */
   protected async run(): Promise<Throws<void, APIConnectionError>> {
+    // After this stream's close() has been called, any child error is a
+    // shutdown artifact, not a real provider failure.
+    const shuttingDown = () => this.isShuttingDown;
+
     const allTTSFailed = this.adapter.status.every((s) => !s.available);
     let lastRequestId: string = '';
     let lastSegmentId: string = '';
@@ -318,6 +322,8 @@ class FallbackChunkedStream extends ChunkedStream {
       this._logger.warn('All fallback TTS instances failed, retrying from first...');
     }
     for (let i = 0; i < this.adapter.ttsInstances.length; i++) {
+      if (shuttingDown()) return;
+
       const tts = this.adapter.ttsInstances[i]!;
       const status = this.adapter.status[i]!;
       if (!status.available && !allTTSFailed) {
@@ -338,38 +344,44 @@ class FallbackChunkedStream extends ChunkedStream {
         // 0.13.25) could otherwise mask a silent failure as a success.
         let sawRawAudio = false;
         for await (const audio of stream) {
-          if (this.abortController.signal.aborted) {
+          if (shuttingDown()) {
             stream.close();
             return;
           }
 
           sawRawAudio = true;
 
-          if (resampler) {
-            for (const frame of resampler.push(audio.frame)) {
-              this.queue.put({
-                ...audio,
-                frame,
-              });
+          const frames = resampler ? [...resampler.push(audio.frame)] : null;
+          const toForward = frames ? frames.map((frame) => ({ ...audio, frame })) : [audio];
+          let aborted = false;
+          for (const item of toForward) {
+            if (forwardOrShutdown(this.queue, item, shuttingDown) === 'shutdown') {
+              aborted = true;
+              break;
             }
-          } else {
-            this.queue.put(audio);
+          }
+          if (aborted) {
+            stream.close();
+            return;
           }
           lastRequestId = audio.requestId;
           lastSegmentId = audio.segmentId;
         }
+
+        if (shuttingDown()) return;
 
         // Only flush the resampler if real audio actually went in — otherwise
         // flush() can return phantom frames that would mask a silent failure
         // from the primary provider.
         if (resampler && sawRawAudio) {
           for (const frame of resampler.flush()) {
-            this.queue.put({
+            const item = {
               requestId: lastRequestId || '',
               segmentId: lastSegmentId || '',
               frame,
               final: true,
-            });
+            };
+            if (forwardOrShutdown(this.queue, item, shuttingDown) === 'shutdown') return;
           }
         }
 
@@ -383,6 +395,7 @@ class FallbackChunkedStream extends ChunkedStream {
         this._logger.debug({ tts: tts.label }, 'TTS synthesis succeeded');
         return;
       } catch (error) {
+        if (shuttingDown()) return;
         if (error instanceof APIError || error instanceof APIConnectionError) {
           this._logger.warn({ tts: tts.label, error }, 'TTS failed, switching to next instance');
           this.adapter.markUnAvailable(i);
@@ -393,6 +406,7 @@ class FallbackChunkedStream extends ChunkedStream {
         resampler?.close();
       }
     }
+    if (shuttingDown()) return;
     const labels = this.adapter.ttsInstances.map((t) => t.label).join(', ');
     throw new APIConnectionError({
       message: `all TTS instances failed (${labels})`,
@@ -421,6 +435,10 @@ class FallbackSynthesizeStream extends SynthesizeStream {
    * @throws {APIConnectionError} When all TTS providers have been exhausted
    */
   protected async run(): Promise<Throws<void, APIConnectionError>> {
+    // After this stream's close() has been called, any child failure is a
+    // shutdown artifact, not a real provider failure.
+    const shuttingDown = () => this.isShuttingDown;
+
     const allTTSFailed = this.adapter.status.every((s) => !s.available);
     if (allTTSFailed) {
       this._logger.warn('All fallback TTS instances failed, retrying from first...');
@@ -440,6 +458,11 @@ class FallbackSynthesizeStream extends SynthesizeStream {
     })();
 
     for (let i = 0; i < this.adapter.ttsInstances.length; i++) {
+      if (shuttingDown()) {
+        await readInputLLMStream.catch(() => {});
+        return;
+      }
+
       const tts = this.adapter.getStreamingInstance(i);
       const originalTts = this.adapter.ttsInstances[i]!;
       const status = this.adapter.status[i]!;
@@ -575,6 +598,10 @@ class FallbackSynthesizeStream extends SynthesizeStream {
         await readInputLLMStream.catch(() => {});
         return;
       } catch (error) {
+        if (shuttingDown()) {
+          await readInputLLMStream.catch(() => {});
+          return;
+        }
         if (this.audioPushed) {
           this._logger.error(
             { tts: originalTts.label },
@@ -597,6 +624,7 @@ class FallbackSynthesizeStream extends SynthesizeStream {
       }
     }
     await readInputLLMStream.catch(() => {});
+    if (shuttingDown()) return;
     const labels = this.adapter.ttsInstances.map((t) => t.label).join(', ');
     throw new APIConnectionError({
       message: `all TTS instances failed (${labels})`,

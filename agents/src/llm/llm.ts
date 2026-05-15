@@ -308,6 +308,16 @@ export abstract class LLMStream implements AsyncIterableIterator<ChatChunk> {
 
   protected abstract run(): Promise<void>;
 
+  /**
+   * True once `close()` has been called on this stream — i.e. the abort signal
+   * has fired or our event queue has been closed. Subclasses (including plugin
+   * implementations) should check this in long-running loops and exit silently
+   * rather than throwing or emitting error events.
+   */
+  protected get isShuttingDown(): boolean {
+    return this.abortController.signal.aborted || this.queue.closed;
+  }
+
   /** The function context of this stream. */
   get toolCtx(): ToolContext | undefined {
     return this.#toolCtx;

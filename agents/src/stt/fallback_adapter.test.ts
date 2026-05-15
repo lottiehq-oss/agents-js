@@ -297,6 +297,124 @@ describe('FallbackSpeechStream (streaming path)', () => {
     expect(adapter.status[1]?.available).toBe(false);
   });
 
+  it('does not engage fallback when close() races with child events', async () => {
+    // Regression: SpeechStream.close() synchronously closes this.queue and
+    // aborts. If a child event arrives while run() is still iterating, the
+    // next `this.queue.put(ev)` throws "Queue is closed", lands in the catch
+    // block, and gets logged as "unexpected error, switching to next STT" —
+    // flipping the primary to unavailable and then doing the same to the
+    // fallback. Guard: shutdown detection short-circuits the loop silently.
+    const primary = new FakeSTT({ label: 'primary', fakeTranscript: 'first' });
+    const fallback = new FakeSTT({ label: 'fallback' });
+    const adapter = new FallbackAdapter({
+      sttInstances: [primary, fallback],
+      maxRetryPerSTT: 0,
+    });
+
+    const availabilityChanges: Array<{ stt: STT; available: boolean }> = [];
+    (adapter as unknown as EventEmitter).on(
+      'stt_availability_changed',
+      (ev: { stt: STT; available: boolean }) => availabilityChanges.push(ev),
+    );
+
+    const stream = adapter.stream();
+
+    // Consume the first transcript so we know the child is live.
+    const first = await stream.next();
+    expect(first.value?.alternatives?.[0]?.text).toBe('first');
+
+    // Inject a follow-up event from the primary that will land after close().
+    const [primaryStream] = await Promise.all([primary.streamCh.next()]);
+    expect(primaryStream.done).toBe(false);
+
+    // Close the parent while the primary is still alive. The primary may
+    // still push events into its queue; the parent must absorb that quietly.
+    stream.close();
+    primaryStream.value!.sendFakeTranscript('post-close');
+
+    // Drain to completion — the adapter must exit silently.
+    const events: SpeechEvent[] = [];
+    for await (const ev of stream) events.push(ev);
+
+    expect(availabilityChanges).toEqual([]);
+    expect(adapter.status[0]?.available).toBe(true);
+    expect(adapter.status[1]?.available).toBe(true);
+  });
+
+  it('settles recovery probes when the stream exits (success path)', async () => {
+    // Regression: tryRecoverStream pushes a probe onto this.recoveringStreams
+    // and stores its task on adapter.status[i].recoveringStreamTask. The probe
+    // reads from the forwarder, but the forwarder dies when run() returns —
+    // so without an explicit close, the probe's input never EOFs and the
+    // recovery task hangs forever. The finally block in run() must close
+    // probes on every exit path.
+    const primary = new FakeSTT({
+      label: 'primary',
+      fakeException: new APIError('primary down'),
+    });
+    const fallback = new FakeSTT({ label: 'fallback', fakeTranscript: 'hello world' });
+    const adapter = new FallbackAdapter({
+      sttInstances: [primary, fallback],
+      maxRetryPerSTT: 0,
+    });
+
+    const stream = adapter.stream();
+    stream.endInput();
+
+    const events: SpeechEvent[] = [];
+    for await (const ev of stream) events.push(ev);
+
+    // Primary errored → a recovery task was started for it.
+    expect(adapter.status[0]?.recoveringStreamTask).not.toBeNull();
+
+    // The finally block should have closed the probe and the task should
+    // complete promptly (not hang).
+    const task = adapter.status[0]!.recoveringStreamTask!;
+    const settled = await Promise.race([
+      task.result.then(() => 'done' as const).catch(() => 'done' as const),
+      new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 500)),
+    ]);
+    expect(settled).toBe('done');
+    expect(task.done).toBe(true);
+  });
+
+  it('settles recovery probes when the stream is closed (shutdown path)', async () => {
+    // Mirror of the success-path test but exiting via stream.close() instead
+    // of input EOF. Both paths must drain probes.
+    const primary = new FakeSTT({
+      label: 'primary',
+      fakeException: new APIError('primary down'),
+    });
+    const fallback = new FakeSTT({ label: 'fallback', fakeTranscript: 'hello world' });
+    const adapter = new FallbackAdapter({
+      sttInstances: [primary, fallback],
+      maxRetryPerSTT: 0,
+    });
+
+    const stream = adapter.stream();
+    stream.endInput();
+
+    // Consume the fallback's first event so primary's recovery probe is up.
+    const first = await stream.next();
+    expect(first.value?.alternatives?.[0]?.text).toBe('hello world');
+    expect(adapter.status[0]?.recoveringStreamTask).not.toBeNull();
+
+    stream.close();
+
+    // Drain to settle.
+    for await (const _ of stream) {
+      // discard
+    }
+
+    const task = adapter.status[0]!.recoveringStreamTask!;
+    const settled = await Promise.race([
+      task.result.then(() => 'done' as const).catch(() => 'done' as const),
+      new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 500)),
+    ]);
+    expect(settled).toBe('done');
+    expect(task.done).toBe(true);
+  });
+
   it('ends the fallback child when input EOF arrives before failover', async () => {
     // Regression: if endInput() is called on the adapter (input EOF) before
     // the primary errors, the forwarder exits having only seen the primary.

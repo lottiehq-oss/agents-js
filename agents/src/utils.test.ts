@@ -6,12 +6,14 @@ import { ReadableStream } from 'node:stream/web';
 import { describe, expect, it } from 'vitest';
 import { initializeLogger } from '../src/log.js';
 import {
+  AsyncIterableQueue,
   Event,
   Queue,
   Task,
   TaskResult,
   dedent,
   delay,
+  forwardOrShutdown,
   isPending,
   resampleStream,
 } from '../src/utils.js';
@@ -29,6 +31,56 @@ describe('utils', () => {
       controller.abort();
 
       await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    });
+  });
+
+  describe('forwardOrShutdown', () => {
+    it("returns 'ok' on a successful put", () => {
+      const queue = new AsyncIterableQueue<number>();
+      expect(forwardOrShutdown(queue, 1, () => false)).toBe('ok');
+    });
+
+    it("returns 'shutdown' when isShuttingDown is already true", () => {
+      const queue = new AsyncIterableQueue<number>();
+      expect(forwardOrShutdown(queue, 1, () => true)).toBe('shutdown');
+    });
+
+    it("returns 'shutdown' when the queue is already closed", () => {
+      const queue = new AsyncIterableQueue<number>();
+      queue.close();
+      expect(forwardOrShutdown(queue, 1, () => false)).toBe('shutdown');
+    });
+
+    it("returns 'shutdown' when close races between the guard and the put", () => {
+      // Simulate the race: guard says open, then `put` throws because the
+      // queue was closed in between (isShuttingDown becomes true too).
+      const queue = new AsyncIterableQueue<number>();
+      let shutdown = false;
+      const isShuttingDown = () => shutdown;
+
+      const originalPut = queue.put.bind(queue);
+      let firstCall = true;
+      queue.put = ((item: number) => {
+        if (firstCall) {
+          firstCall = false;
+          shutdown = true;
+          queue.close();
+          originalPut(item); // throws "Queue is closed"
+        } else {
+          originalPut(item);
+        }
+      }) as typeof queue.put;
+
+      expect(forwardOrShutdown(queue, 1, isShuttingDown)).toBe('shutdown');
+    });
+
+    it('re-throws unexpected errors from put', () => {
+      const queue = new AsyncIterableQueue<number>();
+      queue.put = () => {
+        throw new Error('boom');
+      };
+
+      expect(() => forwardOrShutdown(queue, 1, () => false)).toThrow('boom');
     });
   });
 

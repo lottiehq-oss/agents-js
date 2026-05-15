@@ -397,6 +397,16 @@ export abstract class SpeechStream implements AsyncIterableIterator<SpeechEvent>
     return this.abortController.signal;
   }
 
+  /**
+   * True once `close()` has been called on this stream — i.e. the abort signal
+   * has fired or our event queue has been closed. Subclasses (including plugin
+   * implementations) should check this in long-running loops and exit silently
+   * rather than throwing or emitting error events.
+   */
+  protected get isShuttingDown(): boolean {
+    return this.abortController.signal.aborted || this.queue.closed;
+  }
+
   get startTimeOffset(): number {
     return this._startTimeOffset;
   }
